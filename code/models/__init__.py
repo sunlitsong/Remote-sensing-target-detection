@@ -1,6 +1,3 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-from .detr import build
-
-
-def build_model(args):
-    return build(args)
+# Note: This __init__.py is kept for backward compatibility
+# Main model building is done in pc2aq.py

@@ -117,8 +117,7 @@ class PC2AQ(nn.Module):
             images: [B, 3, H, W]
         
         Returns:
-            query_features: [B, num_queries, hidden_dim] 每个 query 的特征
-            pred_boxes: [B, num_queries, 4] 预测的边界框 (cx, cy, w, h) in [0, 1]
+            src: [B, C, H, W] backbone 特征图 (经过 FPN 融合)
         """
         # 转换为 NestedTensor
         if isinstance(images, (list, torch.Tensor)):
@@ -128,7 +127,14 @@ class PC2AQ(nn.Module):
             
         # 通过 DETR 前向传播
         features, pos = self.backbone(samples)
-        src, mask = features[-1].decompose()
+        
+        # Apply FPN for multi-scale feature fusion
+        if hasattr(self.backbone, 'fpn'):
+            fpn_features = self.backbone.fpn(features)
+            # Use the highest resolution feature map (from layer1) for small objects
+            src = fpn_features[0].tensors  # Highest resolution
+        else:
+            src, mask = features[-1].decompose()
 
         return src
     
@@ -273,8 +279,19 @@ class PC2AQ(nn.Module):
             frame = nested_tensor_from_tensor_list(frame)
         features, pos = self.backbone(frame)
 
-        src, mask = features[-1].decompose()
-        assert mask is not None
+        # Apply FPN for multi-scale feature fusion
+        if hasattr(self.backbone, 'fpn'):
+            fpn_features = self.backbone.fpn(features)
+            src = fpn_features[0].tensors  # Use highest resolution for small objects
+            mask = features[-1].mask
+            # Generate position encoding for the fused feature map
+            from util.misc import NestedTensor
+            pos_enc = self.backbone[1](NestedTensor(src, mask))
+        else:
+            src, mask = features[-1].decompose()
+            pos_enc = pos[-1]
+        
+        assert src is not None
 
         transofrmer_input = self.input_proj(src)
         content_queries = self.build_content_queries(prototypes)
@@ -283,7 +300,7 @@ class PC2AQ(nn.Module):
         position_queries = self.build_position_queries(self.anchors.sigmoid())
         queries = position_queries + enhanced_content
 
-        hs = self.transformer(transofrmer_input, mask, queries, pos[-1])[0]
+        hs = self.transformer(transofrmer_input, mask, queries, pos_enc)[0]
         
         # 使用最后一层的输出
         # query_features: [B, num_queries, hidden_dim]
@@ -466,6 +483,10 @@ class SetCriterion(nn.Module):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+           
+           For small object detection:
+           - Add scale-aware weights to give more importance to small objects
+           - Normalize GIoU loss by object area
         """
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
@@ -474,12 +495,37 @@ class SetCriterion(nn.Module):
 
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
+        # Scale-aware weighting for small objects
+        # Calculate target box areas (w * h)
+        target_areas = target_boxes[:, 2] * target_boxes[:, 3]
+        
+        # Define scale thresholds (normalized coordinates)
+        # Small object: area < 0.01 (approximately 64x64 pixels on 640x640 image)
+        # Tiny object: area < 0.0025 (approximately 32x32 pixels)
+        scale_weights = torch.ones_like(target_areas)
+        small_mask = target_areas < 0.01
+        tiny_mask = target_areas < 0.0025
+        
+        # Give higher weights to smaller objects
+        scale_weights[small_mask] = 2.0
+        scale_weights[tiny_mask] = 4.0
+        
+        # Apply scale weights to bbox loss
+        loss_bbox_weighted = loss_bbox * scale_weights.unsqueeze(1)
+        
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        losses['loss_bbox'] = loss_bbox_weighted.sum() / num_boxes
 
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+        # Compute GIoU loss
+        giou = box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+            box_ops.box_cxcywh_to_xyxy(target_boxes))
+        
+        # Scale-normalized GIoU for small objects
+        # Small objects have unstable GIoU, normalize by sqrt(area)
+        scale_factor = torch.sqrt(target_areas + 1e-8)
+        loss_giou = (1 - torch.diag(giou)) / scale_factor.clamp(min=0.05)
+        
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
