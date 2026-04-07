@@ -1,42 +1,8 @@
 ```
-# Python
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
+__pycache__/
 
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# Dependencies
-.venv/
-venv/
-env/
-.env
-.env.local
-.env.*
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs
-*.log
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Temporary files
-*.tmp
-*.temp
-
-# OS
-.DS_Store
-Thumbs.db
+# Original rule preserved
+.gitignore
 ```
