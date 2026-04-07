@@ -18,10 +18,20 @@ import torch.distributed as dist
 from torch import Tensor
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
-import torchvision
-if version.parse(torchvision.__version__) < version.parse('0.7'):
+# Note: torchvision import is optional - only needed for specific legacy functions
+try:
+    import torchvision
+    _has_torchvision = True
+except ImportError:
+    _has_torchvision = False
+    torchvision = None
+
+if _has_torchvision and version.parse(torchvision.__version__) < version.parse('0.7'):
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
+else:
+    _new_empty_tensor = None
+    _output_size = None
 
 
 class SmoothedValue(object):
@@ -313,7 +323,7 @@ class NestedTensor(object):
 def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
     # TODO make this more general
     if tensor_list[0].ndim == 3:
-        if torchvision._is_tracing():
+        if _has_torchvision and torchvision._is_tracing():
             # nested_tensor_from_tensor_list() does not export well to ONNX
             # call _onnx_nested_tensor_from_tensor_list() instead
             return _onnx_nested_tensor_from_tensor_list(tensor_list)
@@ -461,14 +471,8 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if version.parse(torchvision.__version__) < version.parse('0.7'):
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(
-                input, size, scale_factor, mode, align_corners
-            )
-
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        return _new_empty_tensor(input, output_shape)
+    if not _has_torchvision or version.parse(torchvision.__version__) < version.parse('0.7'):
+        # Fallback to native torch interpolation
+        return torch.nn.functional.interpolate(input, size, scale_factor, mode, align_corners)
     else:
         return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
