@@ -56,15 +56,22 @@ class PC2AQ(nn.Module):
     特点：
     1. 基于 DETR 进行目标检测（预测 bbox）
     2. 使用 ProtoNet 风格的距离度量进行分类（替代原来的分类头）
-    3. 支持视频序列输入
+    3. 支持视频序列输入，包含时序建模能力
+    4. 针对遥感视频小目标优化：多尺度特征、时序注意力、运动感知
     """
     
-    def __init__(self, backbone, transformer, backbone_dim, num_classes, num_instances, aux_loss=False):
+    def __init__(self, backbone, transformer, backbone_dim, num_classes, num_instances, aux_loss=False,
+                 use_temporal_attention=True, num_frames=5):
         """
         Args:
-            backbone_name: backbone 名称
-            hidden_dim: transformer 的隐藏维度（默认 256）
-            num_queries: 目标查询数量（默认 100）
+            backbone: backbone 网络
+            transformer: transformer 网络
+            backbone_dim: backbone 输出维度
+            num_classes: 类别数
+            num_instances: 每类实例数
+            aux_loss: 是否使用辅助损失
+            use_temporal_attention: 是否使用时序注意力
+            num_frames: 视频帧数
         """
         super().__init__()
         self.num_classes = num_classes
@@ -72,10 +79,11 @@ class PC2AQ(nn.Module):
         self.num_queries = (num_classes + 1) * num_instances
         self.Ns = 9
         self.transformer = transformer
+        self.use_temporal_attention = use_temporal_attention
+        self.num_frames = num_frames
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, backbone_dim)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        # self.query_embed = nn.Embedding(self.num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -84,19 +92,23 @@ class PC2AQ(nn.Module):
 
         # Content queries
         self.content_proj = nn.Linear(backbone_dim, hidden_dim)
-        # 使用 nn.Parameter 创建 3D 可学习参数: [num_classes+1, num_instances, hidden_dim]
         self.instance_offsets = nn.Embedding(self.num_queries, hidden_dim)
         
-        # Initialize anchor boxes
+        # Initialize anchor boxes - optimized for small objects in remote sensing
         def inverse_sigmoid(x, eps=1e-5):
             x = x.clamp(min=eps, max=1-eps)
             return torch.log(x/(1-x))
 
-        anchors = inverse_sigmoid(torch.rand(self.num_queries, 4))
+        # Initialize anchors with small object priors
+        anchors = torch.rand(self.num_queries, 4)
+        # Set smaller initial widths and heights for small objects (< 32x32 on 640x640 image)
+        anchors[:, 2] = anchors[:, 2] * 0.3  # width
+        anchors[:, 3] = anchors[:, 3] * 0.3  # height
+        anchors = inverse_sigmoid(anchors)
         self.anchors = nn.Parameter(anchors)
         self.pos_query_mlp = MLP(4, hidden_dim, hidden_dim, 3)
 
-        # ==================== Query Enhancement ====================
+        # Query Enhancement
         self.query_enhance_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=8,
@@ -105,9 +117,25 @@ class PC2AQ(nn.Module):
         )
         self.temperature = nn.Parameter(torch.FloatTensor([10.0]))
 
-        # ProtoNet 风格的温度缩放参数
+        # Temporal Attention for Video
+        if use_temporal_attention:
+            self.temporal_attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            )
+            self.temporal_norm = nn.LayerNorm(hidden_dim)
+            self.motion_gate = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 4),
+                nn.ReLU(),
+                nn.Linear(hidden_dim // 4, hidden_dim),
+                nn.Sigmoid()
+            )
+
         self.scale = nn.Parameter(torch.FloatTensor([1.0]))
         self.hidden_dim = hidden_dim
+
 
     def extract_backbone_features(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

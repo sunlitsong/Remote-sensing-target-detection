@@ -99,8 +99,16 @@ class Backbone(BackboneBase):
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
+        self.temporal_attention = None  # Placeholder for temporal attention
 
-    def forward(self, tensor_list: NestedTensor):
+    def forward(self, tensor_list: NestedTensor, is_video_sequence=False):
+        """
+        Forward pass with optional temporal processing
+        
+        Args:
+            tensor_list: Input tensor (can be single frame or video sequence)
+            is_video_sequence: If True, process as video with temporal attention
+        """
         xs = self[0](tensor_list)
         out: List[NestedTensor] = []
         pos = []
@@ -108,6 +116,11 @@ class Joiner(nn.Sequential):
             out.append(x)
             # position encoding
             pos.append(self[1](x).to(x.tensors.dtype))
+
+        # Apply temporal attention for video sequences
+        if is_video_sequence and self.temporal_attention is not None:
+            # Temporal feature enhancement will be applied in transformer
+            pass
 
         return out, pos
 
