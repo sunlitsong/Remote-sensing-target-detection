@@ -68,6 +68,7 @@ class BackboneBase(nn.Module):
             return_layers = {'layer4': "0"}
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
+        self.return_interm_layers = return_interm_layers
 
     def forward(self, tensor_list: NestedTensor):
         xs = self.body(tensor_list.tensors)
@@ -86,8 +87,10 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool):
+        # 针对小目标检测：使用 dilation 替代 stride，减小下采样倍率
+        # layer3 和 layer4 使用 dilation，使最终 stride 从 32 变为 16
         backbone = getattr(torchvision.models, name)(
-            replace_stride_with_dilation=[False, False, dilation],
+            replace_stride_with_dilation=[False, True, dilation],
             pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
@@ -109,11 +112,66 @@ class Joiner(nn.Sequential):
         return out, pos
 
 
+class FeaturePyramidNetwork(nn.Module):
+    """
+    Feature Pyramid Network for multi-scale feature fusion.
+    Crucial for small object detection as it combines high-resolution shallow features
+    with semantic-rich deep features.
+    """
+    def __init__(self, in_channels_list, out_channels=256):
+        super().__init__()
+        self.inner_blocks = nn.ModuleList()
+        self.layer_blocks = nn.ModuleList()
+        
+        for in_channels in in_channels_list:
+            inner_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            layer_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            self.inner_blocks.append(inner_conv)
+            self.layer_blocks.append(layer_conv)
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_uniform_(m.weight, a=1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, features: Dict[str, NestedTensor]) -> List[NestedTensor]:
+        # Extract tensors from NestedTensor
+        feature_tensors = [f.tensors for f in features.values()]
+        
+        # Last layer inner connection
+        last_inner = self.inner_blocks[-1](feature_tensors[-1])
+        results = [self.layer_blocks[-1](last_inner)]
+        
+        # Top-down pathway with lateral connections
+        for i in range(len(feature_tensors) - 2, -1, -1):
+            inner_lateral = self.inner_blocks[i](feature_tensors[i])
+            
+            # Upsample the top feature map to match the current resolution
+            upsampled = F.interpolate(
+                last_inner, 
+                size=inner_lateral.shape[-2:], 
+                mode='nearest'
+            )
+            last_inner = inner_lateral + upsampled
+            results.insert(0, self.layer_blocks[i](last_inner))
+        
+        return results
+
+
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
-    return_interm_layers = False
+    # Enable multi-scale features for small object detection
+    return_interm_layers = True
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    
+    # Build FPN for multi-scale feature fusion
+    # ResNet-50: layer1=256, layer2=512, layer3=1024, layer4=2048
+    in_channels_list = [256, 512, 1024, 2048]
+    fpn = FeaturePyramidNetwork(in_channels_list, out_channels=256)
+    
     model = Joiner(backbone, position_embedding)
-    model.num_channels = backbone.num_channels
+    model.num_channels = 256  # FPN output channels
+    model.fpn = fpn  # Attach FPN to model
     return model

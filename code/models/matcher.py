@@ -17,18 +17,20 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
+    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_center: float = 2):
         """Creates the matcher
 
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+            cost_center: This is the relative weight of the center point distance (important for small objects)
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
+        self.cost_center = cost_center
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
     @torch.no_grad()
@@ -70,11 +72,25 @@ class HungarianMatcher(nn.Module):
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
+        # Compute the center point distance (especially important for small objects)
+        out_center = out_bbox[:, :2]  # [N, 2] - cx, cy
+        tgt_center = tgt_bbox[:, :2]  # [M, 2] - cx, cy
+        cost_center = torch.cdist(out_center, tgt_center, p=2)
+
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
+        # Scale-normalized GIoU for small objects
+        # Small objects have unstable GIoU, so we normalize by the target area
+        tgt_area = tgt_bbox[:, 2] * tgt_bbox[:, 3] + 1e-8  # [M]
+        scale_factor = torch.sqrt(tgt_area).unsqueeze(0)  # [1, M]
+        cost_giou_normalized = cost_giou / scale_factor.clamp(min=0.01)
+
         # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = (self.cost_bbox * cost_bbox + 
+             self.cost_center * cost_center + 
+             self.cost_class * cost_class + 
+             self.cost_giou * cost_giou_normalized)
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
@@ -83,4 +99,9 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
-    return HungarianMatcher(cost_class=args.set_cost_class, cost_bbox=args.set_cost_bbox, cost_giou=args.set_cost_giou)
+    return HungarianMatcher(
+        cost_class=args.set_cost_class, 
+        cost_bbox=args.set_cost_bbox, 
+        cost_giou=args.set_cost_giou,
+        cost_center=2.0  # Add center point cost for small objects
+    )
