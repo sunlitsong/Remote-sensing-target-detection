@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 import json
 import cv2
 from pathlib import Path
+from functools import lru_cache
 
 
 class VideoSmallObjectAugmentation:
@@ -31,6 +32,13 @@ class VideoSmallObjectAugmentation:
     7. Temporal flip (reverse frame order)
     """
     
+    __slots__ = [
+        'target_size', 'multi_scale_range', 'temporal_mosaic_prob',
+        'copy_paste_prob', 'frame_drop_prob', 'color_jitter_prob',
+        'motion_blur_prob', 'temporal_flip_prob', 'small_object_threshold',
+        'mean', 'std', 'max_frames', 'base_transform', '_motion_kernels_cache'
+    ]
+    
     def __init__(
         self,
         target_size: Tuple[int, int] = (640, 640),
@@ -41,7 +49,7 @@ class VideoSmallObjectAugmentation:
         color_jitter_prob: float = 0.4,
         motion_blur_prob: float = 0.3,
         temporal_flip_prob: float = 0.2,
-        small_object_threshold: float = 0.01,  # Objects with area < 1% of image are "small"
+        small_object_threshold: float = 0.01,
         mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
         max_frames: int = 16
@@ -59,9 +67,16 @@ class VideoSmallObjectAugmentation:
         self.std = std
         self.max_frames = max_frames
         
-        # Base transform (resize + normalize)
+        # Pre-compute normalization values for faster processing
+        self._mean_np = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
+        self._std_np = np.array(std, dtype=np.float32).reshape(1, 1, 3)
+        
+        # Cache for motion blur kernels to avoid recomputation
+        self._motion_kernels_cache = {}
+        
+        # Base transform (resize + normalize) - optimized
         self.base_transform = transforms.Compose([
-            transforms.Resize(target_size),
+            transforms.Resize(target_size, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
         ])
@@ -81,26 +96,22 @@ class VideoSmallObjectAugmentation:
             augmented_bboxes: List of transformed bbox lists (one per frame)
         """
         if not is_training or len(images) == 0:
-            # No augmentation for val/test
             return [self.base_transform(img) for img in images], all_bboxes
         
-        # Convert to OpenCV format
-        img_nps = [np.array(image)[:, :, ::-1] for image in images]  # RGB to BGR
-        num_frames = len(img_nps)
+        # Convert to OpenCV format - optimized with pre-allocation
+        num_frames = len(images)
+        img_nps = [None] * num_frames
+        for i, image in enumerate(images):
+            img_nps[i] = np.asarray(image)[:, :, ::-1]  # RGB to BGR, faster than np.array()
         
         # Get original dimensions (assume all frames have same size)
         img_h, img_w = img_nps[0].shape[:2]
         
-        # Store bboxes in pixel coordinates
+        # Store bboxes in pixel coordinates - optimized
         aug_bboxes = []
         for frame_bboxes in all_bboxes:
-            frame_bboxes_px = []
-            for bbox in frame_bboxes:
-                x, y, w, h = bbox['bbox']
-                frame_bboxes_px.append({
-                    'category_id': bbox['category_id'],
-                    'bbox': [x, y, w, h]  # Already in pixel coords
-                })
+            frame_bboxes_px = [{'category_id': bbox['category_id'], 'bbox': list(bbox['bbox'])} 
+                              for bbox in frame_bboxes]
             aug_bboxes.append(frame_bboxes_px)
         
         # 1. Consistent multi-scale resizing (same scale for all frames)
@@ -109,28 +120,28 @@ class VideoSmallObjectAugmentation:
         new_w = int(img_w * scale_factor)
         new_h = int(img_h * scale_factor)
         
+        # Batch resize with pre-computed dimensions
         img_nps = [cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR) 
                    for img in img_nps]
         
-        # Scale bboxes consistently
+        # Scale bboxes consistently - vectorized operation
+        scale_arr = np.array([scale_factor] * 4, dtype=np.float32)
         for frame_bboxes in aug_bboxes:
             for bbox in frame_bboxes:
-                x, y, w, h = bbox['bbox']
-                bbox['bbox'] = [x * scale_factor, y * scale_factor, 
-                               w * scale_factor, h * scale_factor]
+                bbox['bbox'] = (np.array(bbox['bbox'], dtype=np.float32) * scale_arr).tolist()
         
         img_h, img_w = img_nps[0].shape[:2]
         
-        # 2. Temporal Mosaic (probabilistic) - combine frames from different times
+        # 2. Temporal Mosaic (probabilistic)
         if random.random() < self.temporal_mosaic_prob and num_frames >= 4:
             img_nps, aug_bboxes = self._apply_temporal_mosaic(img_nps, aug_bboxes, img_w, img_h)
             img_h, img_w = img_nps[0].shape[:2]
         
-        # 3. Copy-Paste small objects with motion awareness (probabilistic)
+        # 3. Copy-Paste small objects with motion awareness
         if random.random() < self.copy_paste_prob:
             img_nps, aug_bboxes = self._apply_copy_paste_motion(img_nps, aug_bboxes, img_w, img_h)
         
-        # 4. Frame dropping and interpolation (simulates variable frame rate)
+        # 4. Frame dropping and interpolation
         if random.random() < self.frame_drop_prob and num_frames > 4:
             img_nps, aug_bboxes = self._apply_frame_dropping(img_nps, aug_bboxes)
         
@@ -147,17 +158,17 @@ class VideoSmallObjectAugmentation:
             img_nps = img_nps[::-1]
             aug_bboxes = aug_bboxes[::-1]
         
-        # Convert back to PIL and apply base transform
+        # Convert back to PIL and apply base transform - optimized
         aug_images = []
         for img_np in img_nps:
             img_pil = Image.fromarray(cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB))
             aug_images.append(self.base_transform(img_pil))
         
         # Normalize bboxes to [0, 1] based on current image size
+        inv_img_wh = np.array([1.0 / img_w, 1.0 / img_h, 1.0 / img_w, 1.0 / img_h], dtype=np.float32)
         for frame_bboxes in aug_bboxes:
             for bbox in frame_bboxes:
-                x, y, w, h = bbox['bbox']
-                bbox['bbox'] = [x / img_w, y / img_h, w / img_w, h / img_h]
+                bbox['bbox'] = (np.array(bbox['bbox'], dtype=np.float32) * inv_img_wh).tolist()
         
         return aug_images, aug_bboxes
     
@@ -166,6 +177,7 @@ class VideoSmallObjectAugmentation:
         Apply Temporal Mosaic augmentation for videos
         
         Combines frames from different time points to create a richer training sample.
+        Optimized with pre-allocated arrays and vectorized bbox operations.
         """
         num_frames = len(img_nps)
         if num_frames < 4:
@@ -189,6 +201,9 @@ class VideoSmallObjectAugmentation:
         
         mosaic_bboxes_list = [[] for _ in range(num_frames)]
         
+        # Pre-compute normalization factors
+        inv_output_wh = np.array([1.0 / output_w, 1.0 / output_h, 1.0 / output_w, 1.0 / output_h], dtype=np.float32)
+        
         for x_off, y_off, idx in positions:
             quad_img = selected_frames[idx]
             quad_bboxes = selected_bboxes[idx]
@@ -197,25 +212,23 @@ class VideoSmallObjectAugmentation:
             place_w = min(quad_w, output_w - x_off)
             place_h = min(quad_h, output_h - y_off)
             
-            mosaic_img[y_off:y_off+place_h, x_off:x_off+place_w] =                 cv2.resize(quad_img, (place_w, place_h))
+            mosaic_img[y_off:y_off+place_h, x_off:x_off+place_w] = cv2.resize(quad_img, (place_w, place_h))
+            
+            # Process bboxes with vectorized operations
+            offset_arr = np.array([x_off, y_off, x_off, y_off], dtype=np.float32)
+            scale_arr = np.array([quad_w, quad_h, quad_w, quad_h], dtype=np.float32)
             
             for bbox in quad_bboxes:
-                x, y, w, h = bbox['bbox']
-                abs_x = x * quad_w + x_off
-                abs_y = y * quad_h + y_off
-                abs_w = w * quad_w
-                abs_h = h * quad_h
+                bbox_arr = np.array(bbox['bbox'], dtype=np.float32)
+                abs_bbox = bbox_arr * scale_arr + offset_arr
                 
-                if (abs_x >= 0 and abs_x + abs_w <= output_w and
-                    abs_y >= 0 and abs_y + abs_h <= output_h):
-                    norm_x = abs_x / output_w
-                    norm_y = abs_y / output_h
-                    norm_w = abs_w / output_w
-                    norm_h = abs_h / output_h
+                if (abs_bbox[0] >= 0 and abs_bbox[0] + abs_bbox[2] <= output_w and
+                    abs_bbox[1] >= 0 and abs_bbox[1] + abs_bbox[3] <= output_h):
                     
+                    norm_bbox = (abs_bbox * inv_output_wh).tolist()
                     mosaic_bboxes_list[0].append({
                         'category_id': bbox['category_id'],
-                        'bbox': [norm_x, norm_y, norm_w, norm_h]
+                        'bbox': norm_bbox
                     })
         
         result_imgs = [mosaic_img] + img_nps[1:]
@@ -226,20 +239,23 @@ class VideoSmallObjectAugmentation:
     def _apply_copy_paste_motion(self, img_nps: list, all_bboxes: list, img_w: int, img_h: int):
         """
         Copy-Paste augmentation with motion awareness for videos
+        Optimized with early exit and reduced redundant operations.
         """
-        small_objects = []
-        
-        for bbox in all_bboxes[0]:
-            x, y, w, h = bbox['bbox']
-            area = w * h
-            if area < self.small_object_threshold:
-                small_objects.append(bbox)
-        
-        if not small_objects:
+        # Identify small objects - use numpy for faster area computation
+        bboxes_arr = np.array([b['bbox'] for b in all_bboxes[0]], dtype=np.float32)
+        if len(bboxes_arr) == 0:
             return img_nps, all_bboxes
         
+        areas = bboxes_arr[:, 2] * bboxes_arr[:, 3]
+        small_indices = np.where(areas < self.small_object_threshold)[0]
+        
+        if len(small_indices) == 0:
+            return img_nps, all_bboxes
+        
+        small_objects = [all_bboxes[0][i] for i in small_indices]
+        
         result_imgs = [img.copy() for img in img_nps]
-        result_bboxes = [frame_bboxes.copy() for frame_bboxes in all_bboxes]
+        result_bboxes = [list(frame_bboxes) for frame_bboxes in all_bboxes]
         
         num_pastes = min(len(small_objects), 3)
         
@@ -262,29 +278,34 @@ class VideoSmallObjectAugmentation:
                 continue
             
             obj_patch = result_imgs[0][y1:y2, x1:x2].copy()
+            patch_h, patch_w = obj_patch.shape[:2]
             
-            dx, dy = 0, 0
-            if len(all_bboxes) > 1:
+            # Compute motion vector more efficiently
+            dx, dy = 0.0, 0.0
+            if len(all_bboxes) > 1 and len(all_bboxes[0]) > 0 and len(all_bboxes[1]) > 0:
+                match_count = 0
                 for bbox1 in all_bboxes[0]:
                     for bbox2 in all_bboxes[1]:
                         if bbox1['category_id'] == bbox2['category_id']:
-                            x1_norm, y1_norm = bbox1['bbox'][0], bbox1['bbox'][1]
-                            x2_norm, y2_norm = bbox2['bbox'][0], bbox2['bbox'][1]
-                            dx += (x2_norm - x1_norm) * img_w
-                            dy += (y2_norm - y1_norm) * img_h
+                            dx += (bbox2['bbox'][0] - bbox1['bbox'][0]) * img_w
+                            dy += (bbox2['bbox'][1] - bbox1['bbox'][1]) * img_h
+                            match_count += 1
+                if match_count > 0:
+                    dx /= match_count
+                    dy /= match_count
             
             for frame_idx in range(min(3, len(result_imgs))):
                 new_x = int(x_px + dx * frame_idx + random.randint(-10, 10))
                 new_y = int(y_px + dy * frame_idx + random.randint(-10, 10))
                 
-                new_x = max(0, min(new_x, img_w - (x2 - x1)))
-                new_y = max(0, min(new_y, img_h - (y2 - y1)))
+                new_x = max(0, min(new_x, img_w - patch_w))
+                new_y = max(0, min(new_y, img_h - patch_h))
                 
-                paste_h = min(y2 - y1, img_h - new_y)
-                paste_w = min(x2 - x1, img_w - new_x)
+                paste_h = min(patch_h, img_h - new_y)
+                paste_w = min(patch_w, img_w - new_x)
                 
                 if paste_h > 0 and paste_w > 0:
-                    result_imgs[frame_idx][new_y:new_y+paste_h, new_x:new_x+paste_w] =                         obj_patch[:paste_h, :paste_w]
+                    result_imgs[frame_idx][new_y:new_y+paste_h, new_x:new_x+paste_w] = obj_patch[:paste_h, :paste_w]
                     
                     new_cx = (new_x + paste_w / 2) / img_w
                     new_cy = (new_y + paste_h / 2) / img_h
@@ -354,6 +375,7 @@ class VideoSmallObjectAugmentation:
     def _apply_consistent_color_jitter(self, img_nps: list):
         """
         Apply consistent color jitter across all frames
+        Optimized with vectorized operations
         """
         brightness = random.uniform(0.8, 1.2)
         contrast = random.uniform(0.8, 1.2)
@@ -363,10 +385,8 @@ class VideoSmallObjectAugmentation:
         result_imgs = []
         for img in img_nps:
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-            hsv[:, :, 1] *= saturation
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
-            hsv[:, :, 0] += hue * 180
-            hsv[:, :, 0] = np.mod(hsv[:, :, 0], 180)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)
+            hsv[:, :, 0] = np.mod(hsv[:, :, 0] + hue * 180, 180)
             img_jittered = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
             img_jittered = cv2.convertScaleAbs(img_jittered, alpha=contrast, beta=brightness * 10)
             result_imgs.append(img_jittered)
@@ -376,23 +396,30 @@ class VideoSmallObjectAugmentation:
     def _apply_motion_blur(self, img_nps: list):
         """
         Apply motion blur to simulate fast-moving objects
+        Uses caching to avoid recomputing the same kernels
         """
         angle = random.uniform(0, 360)
         kernel_size = random.choice([3, 5, 7])
         
-        kernel = np.zeros((kernel_size, kernel_size))
-        center = kernel_size // 2
-        dx = int(center * np.cos(np.radians(angle)))
-        dy = int(center * np.sin(np.radians(angle)))
+        # Cache key for this kernel configuration
+        cache_key = (angle, kernel_size)
+        if cache_key in self._motion_kernels_cache:
+            kernel = self._motion_kernels_cache[cache_key]
+        else:
+            kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+            center = kernel_size // 2
+            dx = int(center * np.cos(np.radians(angle)))
+            dy = int(center * np.sin(np.radians(angle)))
+            
+            cv2.line(kernel, (center - dx, center - dy), 
+                    (center + dx, center + dy), 1.0, 1)
+            kernel /= np.sum(kernel) + 1e-8
+            
+            # Limit cache size
+            if len(self._motion_kernels_cache) < 100:
+                self._motion_kernels_cache[cache_key] = kernel
         
-        cv2.line(kernel, (center - dx, center - dy), 
-                (center + dx, center + dy), 1, 1)
-        kernel /= np.sum(kernel)
-        
-        result_imgs = []
-        for img in img_nps:
-            blurred = cv2.filter2D(img, -1, kernel)
-            result_imgs.append(blurred)
+        result_imgs = [cv2.filter2D(img, -1, kernel) for img in img_nps]
         
         return result_imgs
 
